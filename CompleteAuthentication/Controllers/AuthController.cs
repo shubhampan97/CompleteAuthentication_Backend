@@ -2,6 +2,8 @@
 using CompleteAuthentication.DTOs;
 using CompleteAuthentication.Models;
 using CompleteAuthentication.Services;
+using Google.Apis.Auth;
+using Google.Authenticator;
 using Microsoft.AspNetCore.Mvc;
 
 namespace CompleteAuthentication.Controllers
@@ -12,6 +14,8 @@ namespace CompleteAuthentication.Controllers
     {
         private ApplicationDbContext _dbContext;
         private IConfiguration _configuration;
+
+        private readonly string appName = "LoginApi";
         public AuthController(ApplicationDbContext dbContext, IConfiguration configuration)
         {
             _dbContext = dbContext;
@@ -54,6 +58,103 @@ namespace CompleteAuthentication.Controllers
                 return Unauthorized("Invalid credentials");
             }
 
+            if(user.TfaSecret is not null)
+            {
+                return Ok(new
+                {
+                    id = user.Id,
+                    secret = user.TfaSecret
+                });
+            }
+
+            Random random = new Random();
+            string secret = new(Enumerable.Repeat("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567", 32).Select(s => s[random.Next(s.Length)]).ToArray());
+
+            string otpAuthUrl = $"otpauth://totp/{appName}:Secret?secret={secret}&issuer={appName}".Replace(" ", "%20");
+
+            return Ok(new {
+                id = user.Id,
+                secret,
+                otpauth_url = otpAuthUrl
+            });
+
+
+
+        }
+
+        [HttpPost("two-factor")]
+        public IActionResult TwoFactor(TwoFactorDTO dto)
+        {
+            User? user = _dbContext.Users.FirstOrDefault(u=>u.Id == dto.Id);
+
+            if(user is null)
+            {
+                return Unauthorized("Invalid credentials");
+            }
+
+            string secret = user.TfaSecret is not null ? user.TfaSecret : dto.Secret;
+
+            TwoFactorAuthenticator tfa = new();
+            if(!tfa.ValidateTwoFactorPIN(secret, dto.Code, true))
+            {
+                return Unauthorized("Invalid Credentials"); 
+            }
+
+            if(user.TfaSecret is null)
+            {
+                _dbContext.Users.FirstOrDefault(x => x.Email == user.Email).TfaSecret = dto.Secret;
+                _dbContext.SaveChanges();
+            }
+
+            string accessToken = TokenService.CreateAccessToken(dto.Id, _configuration.GetSection("JWT:AccessKey").Value);
+            string refreshToken = TokenService.CreateRefreshToken(dto.Id, _configuration.GetSection("JWT:RefreshKey").Value);
+
+            CookieOptions cookieOptions = new CookieOptions
+            {
+                HttpOnly = true,
+                SameSite = SameSiteMode.None,
+                Secure = true
+            };
+            Response.Cookies.Append("refresh_token", refreshToken, cookieOptions);
+            _dbContext.UserTokens.Add(new()
+            {
+                UserId = dto.Id,
+                Token = refreshToken,
+                ExpiresAt = DateTime.Now.AddDays(7),
+            });
+            _dbContext.SaveChanges();
+            return Ok(new
+            {
+                accessToken
+            });
+        }
+
+
+        [HttpPost("google-auth")]
+        public async Task<IActionResult> GoogleAuth(GoogleAuthDto dto)
+        {
+            var googleUser = await GoogleJsonWebSignature.ValidateAsync(dto.Token);
+            if(googleUser is null)
+            {
+                return Unauthorized("Unauthenticated");
+            }
+
+            User? user = _dbContext.Users.Where(u=>u.Email==googleUser.Email).FirstOrDefault();
+            if (user is null)
+            {
+                user = new()
+                {
+                    FirstName = googleUser.GivenName,
+                    LastName = googleUser.FamilyName,
+                    Email = googleUser.Email,
+                    Password = dto.Token
+                };
+
+                _dbContext.Users.Add(user);
+                _dbContext.SaveChanges();
+
+                user.Id = _dbContext.Users.Where(u => u.Email == user.Email).FirstOrDefault()!.Id;
+            }
             string accessToken = TokenService.CreateAccessToken(user.Id, _configuration.GetSection("JWT:AccessKey").Value);
             string refreshToken = TokenService.CreateRefreshToken(user.Id, _configuration.GetSection("JWT:RefreshKey").Value);
 

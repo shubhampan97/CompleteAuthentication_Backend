@@ -20,5 +20,9 @@ namespace CompleteAuthentication.Models
         [JsonIgnore]
         public string Password { get; set; } = default!;
 
+        [JsonPropertyName("tfa_secret")]
+        public string? TfaSecret { get; set; }
+
+
     }
 }
